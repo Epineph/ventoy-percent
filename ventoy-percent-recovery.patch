@@ -1,0 +1,708 @@
+diff --git a/README.md b/README.md
+index 1a232ae..e6f14a0 100755
+--- a/README.md
++++ b/README.md
+@@ -5,10 +5,11 @@
+ For example, `--iso-percent 15` targets approximately 15% for that partition.
+ The remainder, minus Ventoy's boot data, stays unallocated for later partitions.
+ 
+-This is a Linux wrapper around your existing Ventoy installation. It does not
+-resize an existing installation or preserve existing partitions. **Executing an
+-installation erases the disk's existing data.** Select the whole disk, such as
+-`/dev/sda`, rather than a partition such as `/dev/sda1`.
++This is a Linux wrapper around your existing Ventoy installation. It supports
++installation, reinstallation, and updates. **Installing or reinstalling erases
++the disk's existing data.** Updates retain the existing layout and ISO files;
++they do not resize partitions. Select the whole disk, such as `/dev/sda`, rather
++than a partition such as `/dev/sda1`.
+ 
+ ## Requirements
+ 
+@@ -44,10 +45,10 @@ After verifying the selected disk and backing up its contents, install:
+ sudo ./ventoy-percent --iso-percent 15 -g -L iso_disk --execute /dev/sda
+ ```
+ 
+-The wrapper uses Ventoy's `-i` install action and retains Ventoy's confirmation
+-prompts. Ventoy refuses `-i` when it detects an existing Ventoy installation.
+-This wrapper intentionally has no force-reinstall option. A changed percentage
+-does not resize an existing installation.
++The default action uses Ventoy's `-i` and retains its confirmation prompts.
++Ventoy refuses `-i` when it detects an existing Ventoy installation. Use
++`--reinstall` to erase and reinstall instead. A changed percentage only takes
++effect during installation/reinstallation.
+ 
+ The wrapper rejects execution when lsblk shows mounted filesystems, active swap,
+ or active device mappings on the disk. Unmount/deactivate those first.
+@@ -67,6 +68,79 @@ sudo install -m 0755 ventoy-percent /usr/local/bin/ventoy-percent
+ ventoy-percent --iso-percent 15 -g -L iso_disk /dev/sda
+ ```
+ 
++After changing the source, repeat the `sudo install` command to update an
++existing system-wide copy.
++
++## Operations and confirmations
++
++| Operation | Accepted flags | Ventoy action |
++| --- | --- | --- |
++| Install (default) | `--install`, `-i` | `-i` |
++| Reinstall, erasing the disk | `--reinstall`, `--re-install`, `-I` | `-I` |
++| Update existing Ventoy | `--update`, `-u`, `-U` | `-u` |
++
++Choose one operation. `--iso-percent` is required for install/reinstall and
++optional for update. Updates ignore `--iso-percent`, `-g`/`--gpt`, and
++`-L`/`--label`, and print that the existing layout will be retained.
++
++All operations preview unless `--execute` is present. Confirmation flags alone
++never enable execution. With no confirmation flags, Ventoy handles its native
++prompts: two for install/reinstall and one for update. With confirmation flags,
++the wrapper handles the following two approval stages before starting Ventoy:
++
++| Flags | First approval | Final approval |
++| --- | --- | --- |
++| `--apply` | Automatic | Type `y` or `Y` |
++| `--yes`, `--noconfirm`, or `--noconfir` | Type `y` or `Y` | Automatic |
++| `--apply --yes` (or either no-confirm alias) | Automatic | Automatic |
++| `--force` | Automatic | Automatic |
++| `--verify`, with any other flags | Automatic | Type exactly `YES` |
++
++`--force` means `--apply --yes`; it does not select the reinstall operation.
++`--verify` implies `--apply` and `--verbose`. It prints the selected operation,
++disk size, model/serial/transport and complete returned `lsblk` metadata,
++installation sizing details when applicable, approval mode, and exact Ventoy
++command. It requires **uppercase `YES`**, even alongside `--yes`,
++`--noconfirm`, or `--force`. Other answers, closed input, or Ctrl+C cancel the
++operation. `-v`/`--verbose` alone prints details and leaves confirmations intact.
++
++After approval, `--yes`, either no-confirm alias, and `--force` print which
++confirmation protections are disabled and wait **three seconds** before
++starting Ventoy. Ctrl+C can cancel this delay. Fully automatic operation states
++that all remaining **confirmation protections** have been disabled and only an
++error may halt it. Root/device, mount/swap/mapping, read-only, sector, and sizing
++checks remain enforced, as do Ventoy's own validation errors.
++
++Reinstall with your requested layout and an explicit verification prompt:
++
++```sh
++sudo ventoy-percent --execute --reinstall --iso-percent 15 -g -L iso_disk /dev/sda --apply --verify --verbose
++```
++
++`--verify` already implies `--apply --verbose`, so this is equivalent:
++
++```sh
++sudo ventoy-percent --execute -I --iso-percent 15 -g -L iso_disk /dev/sda --verify
++```
++
++Reinstall with both confirmations automatic (warning and three-second delay):
++
++```sh
++sudo ventoy-percent --execute --reinstall --iso-percent 15 -g -L iso_disk /dev/sda --apply --yes
++```
++
++Update existing Ventoy without changing partition sizes:
++
++```sh
++sudo ventoy-percent --execute --update /dev/sda --verify
++```
++
++After wrapper approval, the wrapper supplies exactly two native `y` answers for
++install/reinstall, or one for update, with Ventoy output still visible. These
++counts match Ventoy 1.1.18. Additional prompts receive EOF; Ventoy may exit
++successfully when a prompt receives EOF, so a successful exit status alone does
++not establish that an operation completed on a version with different prompts.
++
+ ## Calculation and limits
+ 
+ Ventoy takes `-r` in **MiB** (1,048,576 bytes). Its layout uses a 1 MiB initial
+diff --git a/test_ventoy_percent.py b/test_ventoy_percent.py
+index 65ad9d1..463d504 100755
+--- a/test_ventoy_percent.py
++++ b/test_ventoy_percent.py
+@@ -1,4 +1,5 @@
+-"""Disk-free checks for sizing, preview behavior, and execution safeguards."""
++#!/usr/bin/env python3
++"""Disk-free checks for sizing, confirmation controls, and execution safeguards."""
+ 
+ import argparse
+ import contextlib
+@@ -7,6 +8,8 @@ import importlib.util
+ import io
+ import json
+ import subprocess
++import sys
++import tempfile
+ import unittest
+ from pathlib import Path
+ from unittest import mock
+@@ -66,7 +69,10 @@ class VentoyPercentTests(unittest.TestCase):
+     with self.assertRaisesRegex(ValueError, "boot data"):
+       ventoy.partition_sizes(ventoy.GIB, ventoy.percentage("99.9"), True)
+ 
+-  def run_cli(self, extra=(), metadata=None, install_status=0):
++  def run_cli(
++    self, extra=(), metadata=None, install_status=0, answers=(), iso_percent="15",
++    sleep_error=None,
++  ):
+     disk = disk_metadata() if metadata is None else metadata
+     inspection = subprocess.CompletedProcess(
+       [], 0, stdout=json.dumps({"blockdevices": [disk]})
+@@ -80,14 +86,15 @@ class VentoyPercentTests(unittest.TestCase):
+       mock.patch.object(ventoy.shutil, "which", return_value="/usr/bin/ventoy"),
+       mock.patch.object(ventoy.os, "geteuid", return_value=0),
+       mock.patch.object(ventoy.Path, "is_block_device", return_value=True),
++      mock.patch("builtins.input", side_effect=answers) as prompt,
++      mock.patch.object(ventoy.time, "sleep", side_effect=sleep_error) as pause,
+       contextlib.redirect_stdout(output),
+       contextlib.redirect_stderr(output),
+     ):
+       try:
+         status = ventoy.main(
+           [
+-            "--iso-percent",
+-            "15",
++            *(["--iso-percent", iso_percent] if iso_percent is not None else []),
+             "-g",
+             "-L",
+             "iso_disk",
+@@ -97,17 +104,19 @@ class VentoyPercentTests(unittest.TestCase):
+         )
+       except SystemExit as error:
+         status = error.code
+-    return status, output.getvalue(), run
++    return status, output.getvalue(), run, prompt, pause
+ 
+   def test_preview_never_calls_installer(self):
+-    status, output, run = self.run_cli()
++    status, output, run, prompt, pause = self.run_cli()
+     self.assertEqual(status, 0)
+     self.assertIn("Preview only", output)
+     self.assertEqual(run.call_count, 1)
+     self.assertEqual(run.call_args.args[0][0], "lsblk")
++    prompt.assert_not_called()
++    pause.assert_not_called()
+ 
+   def test_execution_passes_correct_command_and_exit_status(self):
+-    status, _, run = self.run_cli(["--execute"], install_status=7)
++    status, _, run, prompt, pause = self.run_cli(["--execute"], install_status=7)
+     self.assertEqual(status, 7)
+     self.assertEqual(run.call_count, 2)
+     self.assertEqual(
+@@ -124,11 +133,254 @@ class VentoyPercentTests(unittest.TestCase):
+       ],
+     )
+     self.assertEqual(run.call_args.kwargs, {"check": False})
++    prompt.assert_not_called()
++    pause.assert_not_called()
++
++  def test_operation_aliases_and_native_prompts(self):
++    for aliases, native in [
++      (["--install", "-i"], "-i"),
++      (["--reinstall", "--re-install", "-I"], "-I"),
++      (["--update", "-u", "-U"], "-u"),
++    ]:
++      for alias in aliases:
++        with self.subTest(alias=alias):
++          status, output, run, prompt, pause = self.run_cli(["--execute", alias])
++          self.assertEqual(status, 0, output)
++          self.assertEqual(run.call_args.args[0][1], native)
++          self.assertEqual(run.call_args.kwargs, {"check": False})
++          prompt.assert_not_called()
++          pause.assert_not_called()
++
++  def test_update_needs_no_percentage_and_keeps_layout(self):
++    status, output, run, _, _ = self.run_cli(
++      ["--execute", "--update"], iso_percent=None,
++      metadata=disk_metadata(size=8 * 1024 * ventoy.GIB),
++    )
++    self.assertEqual(status, 0, output)
++    self.assertEqual(
++      run.call_args.args[0], ["/usr/bin/ventoy", "-u", "/dev/example"],
++    )
++    self.assertIn("preserves the existing partition layout", output)
++    self.assertIn("ignored", output)
++    self.assertNotIn("ERASE", output)
++    self.assertNotIn("Reserved for later partitions:", output)
++
++  def test_install_percentage_and_operations_are_validated(self):
++    for flags in [[], ["--reinstall"]]:
++      with self.subTest(flags=flags):
++        status, output, run, _, _ = self.run_cli(flags, iso_percent=None)
++        self.assertEqual(status, 2)
++        self.assertIn("--iso-percent is required", output)
++        run.assert_not_called()
++    status, _, run, _, _ = self.run_cli(["--reinstall", "--update"])
++    self.assertEqual(status, 2)
++    run.assert_not_called()
++
++  def test_apply_keeps_final_confirmation(self):
++    status, _, run, prompt, pause = self.run_cli(
++      ["--execute", "--apply"], answers=["y"], install_status=7,
++    )
++    self.assertEqual(status, 7)
++    self.assertEqual(prompt.call_count, 1)
++    self.assertIn("Final confirmation", prompt.call_args.args[0])
++    self.assertEqual(
++      run.call_args.kwargs, {"input": "y\ny\n", "text": True, "check": False},
++    )
++    pause.assert_not_called()
++
++  def test_yes_aliases_keep_first_confirmation_and_pause_before_launch(self):
++    for alias in ["--yes", "--noconfirm", "--noconfir"]:
++      with self.subTest(alias=alias):
++        status, output, run, prompt, pause = self.run_cli(
++          ["--execute", alias], answers=["Y"],
++        )
++        self.assertEqual(status, 0, output)
++        self.assertEqual(prompt.call_count, 1)
++        self.assertIn("Apply install", prompt.call_args.args[0])
++        self.assertIn("All remaining confirmation protections", output)
++        self.assertIn("only an error may halt it", output)
++        self.assertEqual(run.call_args.kwargs["input"], "y\ny\n")
++        pause.assert_called_once_with(3)
++
++  def test_fully_automatic_modes_never_prompt(self):
++    for flags in [
++      ["--apply", "--yes"], ["--apply", "--noconfirm"],
++      ["--apply", "--noconfir"], ["--force"],
++    ]:
++      with self.subTest(flags=flags):
++        status, output, run, prompt, pause = self.run_cli(["--execute", *flags])
++        self.assertEqual(status, 0, output)
++        self.assertIn("confirmation protections have been disabled", output)
++        self.assertIn("Device and sizing validation remain enforced", output)
++        prompt.assert_not_called()
++        pause.assert_called_once_with(3)
++        # --force is confirmation control, not an implicit destructive reinstall.
++        self.assertEqual(run.call_args.args[0][1], "-i")
++        self.assertEqual(run.call_args.kwargs["input"], "y\ny\n")
++
++  def test_automatic_update_uses_one_native_answer(self):
++    status, output, run, prompt, pause = self.run_cli(
++      ["--execute", "-U", "--force"], iso_percent=None,
++    )
++    self.assertEqual(status, 0, output)
++    self.assertEqual(run.call_args.args[0], ["/usr/bin/ventoy", "-u", "/dev/example"])
++    self.assertEqual(run.call_args.kwargs["input"], "y\n")
++    prompt.assert_not_called()
++    pause.assert_called_once_with(3)
++
++  def test_verify_requires_exact_yes_and_implies_verbose_and_apply(self):
++    for extra in [[], ["--yes"], ["--noconfirm"], ["--force"]]:
++      with self.subTest(extra=extra):
++        status, output, run, prompt, pause = self.run_cli(
++          ["--execute", "--verify", *extra], answers=["YES"],
++        )
++        self.assertEqual(status, 0, output)
++        self.assertIn("Disk metadata (lsblk):", output)
++        self.assertIn('"path": "/dev/example"', output)
++        self.assertIn("Requested ISO percentage: 15%", output)
++        self.assertIn("final=exact YES", output)
++        self.assertEqual(prompt.call_count, 1)
++        self.assertIn("type YES", prompt.call_args.args[0])
++        self.assertEqual(run.call_args.kwargs["input"], "y\ny\n")
++        self.assertNotIn("All remaining confirmation protections", output)
++        if extra:
++          pause.assert_called_once_with(3)
++        else:
++          pause.assert_not_called()
++
++  def test_requested_reinstall_command(self):
++    status, output, run, prompt, _ = self.run_cli(
++      ["--execute", "--reinstall", "--apply", "--verify", "--verbose"],
++      answers=["YES"],
++    )
++    self.assertEqual(status, 0, output)
++    self.assertEqual(run.call_args.args[0][1], "-I")
++    self.assertIn("Installation will ERASE", output)
++    self.assertIn("Partition table: GPT; label: iso_disk", output)
++    self.assertEqual(prompt.call_count, 1)
++
++  def test_declining_any_wrapper_prompt_never_launches(self):
++    for flags, answers in [
++      (["--apply"], ["n"]), (["--yes"], [""]),
++      (["--verify"], ["yes"]), (["--verify"], ["y"]),
++      (["--verify"], ["Yes"]), (["--verify"], [""]),
++      (["--verify"], [" YES "]), (["--verify", "--force"], ["no"]),
++    ]:
++      with self.subTest(flags=flags, answers=answers):
++        status, output, run, _, pause = self.run_cli(
++          ["--execute", *flags], answers=answers,
++        )
++        self.assertEqual(status, 1)
++        self.assertIn("Cancelled", output)
++        self.assertEqual(run.call_count, 1)
++        pause.assert_not_called()
++
++  def test_closed_input_and_interrupted_delay_never_launch(self):
++    status, output, run, _, _ = self.run_cli(
++      ["--execute", "--verify", "--force"], answers=EOFError,
++    )
++    self.assertEqual(status, 1)
++    self.assertIn("confirmation input closed", output)
++    self.assertEqual(run.call_count, 1)
++    status, output, run, _, _ = self.run_cli(
++      ["--execute", "--apply"], answers=KeyboardInterrupt,
++    )
++    self.assertEqual(status, 130)
++    self.assertIn("interrupted", output)
++    self.assertEqual(run.call_count, 1)
++    status, output, run, prompt, pause = self.run_cli(
++      ["--execute", "--force"], sleep_error=KeyboardInterrupt,
++    )
++    self.assertEqual(status, 130)
++    self.assertIn("interrupted", output)
++    self.assertEqual(run.call_count, 1)
++    prompt.assert_not_called()
++    pause.assert_called_once_with(3)
++
++  def test_approval_flags_and_verbose_always_preview_without_execute(self):
++    for flags in [
++      ["--apply"], ["--verify"], ["--yes"], ["--noconfirm"],
++      ["--force"], ["-v"], ["--verbose"], ["--apply", "--yes"],
++    ]:
++      with self.subTest(flags=flags):
++        status, output, run, prompt, pause = self.run_cli(flags)
++        self.assertEqual(status, 0, output)
++        self.assertIn("Preview only", output)
++        self.assertEqual(run.call_count, 1)
++        prompt.assert_not_called()
++        pause.assert_not_called()
++
++  def test_verbose_alone_preserves_native_confirmations(self):
++    for flag in ["-v", "--verbose"]:
++      with self.subTest(flag=flag):
++        status, output, run, prompt, pause = self.run_cli(["--execute", flag])
++        self.assertEqual(status, 0, output)
++        self.assertIn("Disk metadata (lsblk):", output)
++        self.assertEqual(run.call_args.kwargs, {"check": False})
++        prompt.assert_not_called()
++        pause.assert_not_called()
++
++  def test_warning_and_delay_precede_automatic_execution(self):
++    events = []
++    output = io.StringIO()
++    disk = disk_metadata()
++    with (
++      mock.patch.object(ventoy, "read_disk", return_value=disk),
++      mock.patch.object(ventoy, "check_execution"),
++      mock.patch.object(ventoy.shutil, "which", return_value="/usr/bin/ventoy"),
++      contextlib.redirect_stdout(output),
++      mock.patch.object(
++        ventoy.time, "sleep", side_effect=lambda seconds: events.append(
++          ("pause", seconds, output.getvalue()),
++        ),
++      ),
++      mock.patch.object(
++        ventoy.subprocess, "run", side_effect=lambda *args, **kwargs: (
++          events.append(("execute",)), subprocess.CompletedProcess([], 0),
++        )[1],
++      ),
++    ):
++      self.assertEqual(ventoy.main([
++        "--execute", "--iso-percent", "15", "/dev/example", "--force",
++      ]), 0)
++    self.assertEqual([event[0] for event in events], ["pause", "execute"])
++    self.assertEqual(events[0][1], 3)
++    self.assertIn("protections have been disabled", events[0][2])
++
++  def test_native_answer_stream_is_finite_with_real_child(self):
++    # This child only reads stdin. It never invokes Ventoy or opens a disk.
++    real_run = subprocess.run
++    with tempfile.TemporaryDirectory() as directory:
++      fake = Path(directory) / "fake_ventoy.py"
++      fake.write_text(
++        "import sys\n"
++        "lines = list(sys.stdin)\n"
++        "expected = ['y\\n'] * (1 if sys.argv[1] == '-u' else 2)\n"
++        "sys.exit(0 if lines == expected else 9)\n"
++      )
++      for operation in ["--install", "--reinstall", "--update"]:
++        with self.subTest(operation=operation):
++          disk = disk_metadata()
++          with (
++            mock.patch.object(ventoy, "read_disk", return_value=disk),
++            mock.patch.object(ventoy, "check_execution"),
++            mock.patch.object(ventoy.shutil, "which", return_value=sys.executable),
++            mock.patch.object(ventoy.time, "sleep"),
++            contextlib.redirect_stdout(io.StringIO()),
++            mock.patch.object(
++              ventoy.subprocess, "run", side_effect=lambda command, **kwargs: real_run(
++                [sys.executable, str(fake), *command[1:]], timeout=5, **kwargs,
++              ),
++            ),
++          ):
++            self.assertEqual(ventoy.main([
++              "--execute", operation, "--iso-percent", "15", "/dev/example", "--force",
++            ]), 0)
+ 
+   def test_rejects_partition_read_only_and_native_4k(self):
+     for changes in [{"type": "part"}, {"ro": True}, {"log-sec": 4096}]:
+       with self.subTest(changes=changes):
+-        status, _, run = self.run_cli(metadata=disk_metadata(**changes))
++        status, _, run, _, _ = self.run_cli(metadata=disk_metadata(**changes))
+         self.assertEqual(status, 1)
+         self.assertEqual(run.call_count, 1)
+ 
+@@ -140,11 +392,15 @@ class VentoyPercentTests(unittest.TestCase):
+     ]:
+       with self.subTest(kind=kind, mounts=mounts):
+         child = disk_metadata(path="/dev/example1", type=kind, mountpoints=mounts)
+-        status, _, run = self.run_cli(
+-          ["--execute"], disk_metadata(children=[child])
+-        )
+-        self.assertEqual(status, 1)
+-        self.assertEqual(run.call_count, 1)
++        for flags in [[], ["--force"], ["--verify"], ["--apply", "--yes"]]:
++          with self.subTest(flags=flags):
++            status, _, run, prompt, pause = self.run_cli(
++              ["--execute", *flags], disk_metadata(children=[child]),
++            )
++            self.assertEqual(status, 1)
++            self.assertEqual(run.call_count, 1)
++            prompt.assert_not_called()
++            pause.assert_not_called()
+ 
+   def test_requires_root_and_accessible_device_for_execution(self):
+     disk = disk_metadata()
+diff --git a/ventoy-percent b/ventoy-percent
+index 9f27cad..857f6a1 100755
+--- a/ventoy-percent
++++ b/ventoy-percent
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Install Ventoy with an ISO partition sized as a percentage of a disk."""
++"""Install, reinstall, or update Ventoy with explicit confirmation controls."""
+ 
+ import argparse
+ import json
+@@ -9,6 +9,7 @@ import shlex
+ import shutil
+ import subprocess
+ import sys
++import time
+ from fractions import Fraction
+ from pathlib import Path
+ 
+@@ -61,7 +62,7 @@ def read_disk(device):
+       "--json",
+       "--tree",
+       "--output",
+-      "PATH,TYPE,SIZE,LOG-SEC,MOUNTPOINTS,RO",
++      "PATH,TYPE,SIZE,LOG-SEC,MOUNTPOINTS,RO,MODEL,SERIAL,TRAN",
+     ],
+     check=True,
+     capture_output=True,
+@@ -107,26 +108,80 @@ def check_execution(device, disk):
+ # -- CLI ---------------------------------------------------------------------
+ 
+ 
++def confirm_operation(args, device):
++  """Resolve wrapper approvals before providing Ventoy's native answers."""
++  if not args.apply:
++    answer = input(f"Apply {args.operation} to {device}? (y/N) ")
++    if answer not in ("y", "Y"):
++      return False
++
++  if args.verify:
++    answer = input(f"Verify {args.operation} on {device}: type YES to continue: ")
++    if answer != "YES":
++      return False
++  elif not args.assume_yes:
++    answer = input(f"Final confirmation for {device}. Continue? (y/N) ")
++    if answer not in ("y", "Y"):
++      return False
++
++  if args.assume_yes:
++    if args.verify:
++      print(
++        "--verify retained the mandatory YES approval. "
++        "Ventoy's native confirmation prompts will be answered automatically.",
++        flush=True,
++      )
++    else:
++      print(
++        "WARNING: All remaining confirmation protections have been disabled "
++        "for this operation; only an error may halt it. "
++        "Device and sizing validation remain enforced.",
++        flush=True,
++      )
++    print("Continuing in 3 seconds (Ctrl+C to cancel).", flush=True)
++    time.sleep(3)
++  return True
++
++
+ def main(argv=None):
+   parser = argparse.ArgumentParser(
+     description=(
+       "Allocate a percentage of the whole disk to Ventoy's ISO partition. "
+-      "Default: preview only. Installation erases existing disk data."
++      "Default: preview only. Installation/reinstallation erases existing data; "
++      "update preserves the existing partition layout."
+     ),
+     epilog=(
+       "Example: ./ventoy-percent --iso-percent 15 -g -L iso_disk /dev/sda\n"
+       "Install: sudo ./ventoy-percent --iso-percent 15 -g -L iso_disk "
+       "--execute /dev/sda\n"
++      "Verify reinstall: sudo ./ventoy-percent --execute --reinstall "
++      "--iso-percent 15 -g -L iso_disk /dev/sda --apply --verify --verbose\n"
++      "Update: sudo ./ventoy-percent --execute --update /dev/sda\n"
+       "The remainder stays unallocated for partitions you create later."
+     ),
+     formatter_class=argparse.RawDescriptionHelpFormatter,
++    allow_abbrev=False,
+   )
+   parser.add_argument("device", help="whole disk, e.g. /dev/sda")
++  operations = parser.add_mutually_exclusive_group()
++  operations.add_argument(
++    "-i", "--install", dest="operation", action="store_const", const="install",
++    help="install Ventoy; fail if already installed (default)",
++  )
++  operations.add_argument(
++    "-I", "--reinstall", "--re-install", dest="operation",
++    action="store_const", const="reinstall",
++    help="reinstall Ventoy, erasing existing data (Ventoy -I)",
++  )
++  operations.add_argument(
++    "-u", "-U", "--update", dest="operation", action="store_const", const="update",
++    help="update Ventoy without resizing existing partitions (Ventoy -u)",
++  )
++  parser.set_defaults(operation="install")
+   parser.add_argument(
+     "--iso-percent",
+-    required=True,
+     type=percentage,
+-    help="percentage for Part1, e.g. 15 or 12.5%%",
++    help="percentage for Part1, e.g. 15 or 12.5%% (required for install/reinstall)",
+   )
+   parser.add_argument(
+     "-g", "--gpt", action="store_true", help="use GPT (otherwise Ventoy uses MBR)"
+@@ -145,9 +200,34 @@ def main(argv=None):
+   parser.add_argument(
+     "--execute",
+     action="store_true",
+-    help="install now; keep Ventoy's confirmation prompts",
++    help="run the selected operation (otherwise preview only)",
++  )
++  parser.add_argument(
++    "--apply", action="store_true", help="automatically approve the first prompt",
++  )
++  parser.add_argument(
++    "--verify", action="store_true",
++    help="imply --apply and --verbose; require exact YES before execution",
++  )
++  parser.add_argument(
++    "-v", "--verbose", action="store_true",
++    help="print full disk metadata and operation details",
++  )
++  parser.add_argument(
++    "--yes", "--noconfirm", "--noconfir", dest="assume_yes", action="store_true",
++    help="autoapprove the final prompt after a warning and 3 seconds; "
++    "combine with --apply for both prompts (--verify still requires YES)",
++  )
++  parser.add_argument(
++    "--force", action="store_true",
++    help="equivalent to --apply --yes; does not select reinstall or bypass --verify",
+   )
+   args = parser.parse_args(argv)
++  if args.operation != "update" and args.iso_percent is None:
++    parser.error("--iso-percent is required for install/reinstall")
++  args.apply = args.apply or args.verify or args.force
++  args.assume_yes = args.assume_yes or args.force
++  args.verbose = args.verbose or args.verify
+ 
+   try:
+     # Some Ventoy launchers expand $* unquoted; keep labels safe through them.
+@@ -159,36 +239,75 @@ def main(argv=None):
+     device = Path(args.device).resolve()
+     disk = read_disk(device)
+     total = disk["size"]
+-    if not args.gpt and total > 2**41:
+-      raise ValueError("use -g for GPT on disks larger than 2 TiB")
+-    reserved, iso_bytes = partition_sizes(total, args.iso_percent, args.gpt)
+     executable = shutil.which(args.ventoy)
+     if executable is None:
+       raise ValueError(f"Ventoy executable not found: {args.ventoy}")
+-    command = [executable, "-i", "-r", str(reserved)]
+-    if args.gpt:
+-      command.append("-g")
+-    command.extend(["-L", args.label, str(device)])
++    command = [executable]
++    if args.operation == "update":
++      command.extend(["-u", str(device)])
++    else:
++      if not args.gpt and total > 2**41:
++        raise ValueError("use -g for GPT on disks larger than 2 TiB")
++      reserved, iso_bytes = partition_sizes(total, args.iso_percent, args.gpt)
++      command.extend([
++        "-I" if args.operation == "reinstall" else "-i", "-r", str(reserved),
++      ])
++      if args.gpt:
++        command.append("-g")
++      command.extend(["-L", args.label, str(device)])
+ 
++    print(f"Operation: {args.operation}")
+     print(f"Disk: {device} ({total / GIB:.2f} GiB)")
+-    print(
+-      f"ISO partition: ~{iso_bytes / GIB:.2f} GiB "
+-      f"({100 * iso_bytes / total:.4f}% of disk)"
+-    )
+-    print(f"Ventoy boot partition: {BOOT_BYTES // MIB} MiB")
+-    print(
+-      f"Reserved for later partitions: ~{reserved * MIB / GIB:.2f} GiB "
+-      f"(-r {reserved})"
+-    )
++    if args.operation == "update":
++      print(
++        "Update preserves the existing partition layout and ISO files. "
++        "--iso-percent, -g/--gpt and -L/--label do not apply and are ignored."
++      )
++    else:
++      print(
++        f"ISO partition: ~{iso_bytes / GIB:.2f} GiB "
++        f"({100 * iso_bytes / total:.4f}% of disk)"
++      )
++      print(f"Ventoy boot partition: {BOOT_BYTES // MIB} MiB")
++      print(
++        f"Reserved for later partitions: ~{reserved * MIB / GIB:.2f} GiB "
++        f"(-r {reserved})"
++      )
++    if args.verbose:
++      print(f"Capacity: {total} bytes; logical sector: {disk['log-sec']} bytes")
++      if args.operation != "update":
++        print(f"Requested ISO percentage: {float(args.iso_percent):g}%")
++        print(f"Partition table: {'GPT' if args.gpt else 'MBR'}; label: {args.label}")
++        print(f"Estimated ISO bytes: {iso_bytes}; reserved MiB: {reserved}")
++      print(f"Execution: {'enabled' if args.execute else 'preview only'}")
++      print(
++        f"Approvals: first={'automatic' if args.apply else 'interactive'}, "
++        f"final={'exact YES' if args.verify else 'automatic' if args.assume_yes else 'interactive'}"
++      )
++      print("Disk metadata (lsblk):")
++      print(json.dumps(disk, indent=2, sort_keys=True))
+     print(f"Command: {shlex.join(command)}", flush=True)
+ 
+     if not args.execute:
+-      print("Preview only. Add --execute and run with sudo to install.")
++      print("Preview only. Add --execute and run with sudo to run the operation.")
+       return 0
+ 
+     check_execution(device, disk)
+-    print(f"Installation will ERASE existing data on {device}.", flush=True)
+-    return subprocess.run(command, check=False).returncode
++    if args.operation != "update":
++      print(f"Installation will ERASE existing data on {device}.", flush=True)
++    if not (args.apply or args.assume_yes):
++      return subprocess.run(command, check=False).returncode
++    if not confirm_operation(args, device):
++      print("Cancelled. Ventoy was not started.")
++      return 1
++    # Supported Ventoy installs have two y/Y prompts; updates have one.
++    # Keep the input finite: additional prompts receive EOF, never blanket consent.
++    answers = "y\n" if args.operation == "update" else "y\ny\n"
++    return subprocess.run(command, input=answers, text=True, check=False).returncode
++  except EOFError:
++    parser.exit(1, f"{parser.prog}: error: confirmation input closed; Ventoy not started\n")
++  except KeyboardInterrupt:
++    parser.exit(130, f"\n{parser.prog}: interrupted\n")
+   except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+     parser.exit(1, f"{parser.prog}: error: {error}\n")
+ 

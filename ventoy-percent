@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install Ventoy with an ISO partition sized as a percentage of a disk."""
+"""Install, reinstall, or update Ventoy with explicit confirmation controls."""
 
 import argparse
 import json
@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from fractions import Fraction
 from pathlib import Path
 
@@ -61,7 +62,7 @@ def read_disk(device):
       "--json",
       "--tree",
       "--output",
-      "PATH,TYPE,SIZE,LOG-SEC,MOUNTPOINTS,RO",
+      "PATH,TYPE,SIZE,LOG-SEC,MOUNTPOINTS,RO,MODEL,SERIAL,TRAN",
     ],
     check=True,
     capture_output=True,
@@ -107,26 +108,80 @@ def check_execution(device, disk):
 # -- CLI ---------------------------------------------------------------------
 
 
+def confirm_operation(args, device):
+  """Resolve wrapper approvals before providing Ventoy's native answers."""
+  if not args.apply:
+    answer = input(f"Apply {args.operation} to {device}? (y/N) ")
+    if answer not in ("y", "Y"):
+      return False
+
+  if args.verify:
+    answer = input(f"Verify {args.operation} on {device}: type YES to continue: ")
+    if answer != "YES":
+      return False
+  elif not args.assume_yes:
+    answer = input(f"Final confirmation for {device}. Continue? (y/N) ")
+    if answer not in ("y", "Y"):
+      return False
+
+  if args.assume_yes:
+    if args.verify:
+      print(
+        "--verify retained the mandatory YES approval. "
+        "Ventoy's native confirmation prompts will be answered automatically.",
+        flush=True,
+      )
+    else:
+      print(
+        "WARNING: All remaining confirmation protections have been disabled "
+        "for this operation; only an error may halt it. "
+        "Device and sizing validation remain enforced.",
+        flush=True,
+      )
+    print("Continuing in 3 seconds (Ctrl+C to cancel).", flush=True)
+    time.sleep(3)
+  return True
+
+
 def main(argv=None):
   parser = argparse.ArgumentParser(
     description=(
       "Allocate a percentage of the whole disk to Ventoy's ISO partition. "
-      "Default: preview only. Installation erases existing disk data."
+      "Default: preview only. Installation/reinstallation erases existing data; "
+      "update preserves the existing partition layout."
     ),
     epilog=(
       "Example: ./ventoy-percent --iso-percent 15 -g -L iso_disk /dev/sda\n"
       "Install: sudo ./ventoy-percent --iso-percent 15 -g -L iso_disk "
       "--execute /dev/sda\n"
+      "Verify reinstall: sudo ./ventoy-percent --execute --reinstall "
+      "--iso-percent 15 -g -L iso_disk /dev/sda --apply --verify --verbose\n"
+      "Update: sudo ./ventoy-percent --execute --update /dev/sda\n"
       "The remainder stays unallocated for partitions you create later."
     ),
     formatter_class=argparse.RawDescriptionHelpFormatter,
+    allow_abbrev=False,
   )
   parser.add_argument("device", help="whole disk, e.g. /dev/sda")
+  operations = parser.add_mutually_exclusive_group()
+  operations.add_argument(
+    "-i", "--install", dest="operation", action="store_const", const="install",
+    help="install Ventoy; fail if already installed (default)",
+  )
+  operations.add_argument(
+    "-I", "--reinstall", "--re-install", dest="operation",
+    action="store_const", const="reinstall",
+    help="reinstall Ventoy, erasing existing data (Ventoy -I)",
+  )
+  operations.add_argument(
+    "-u", "-U", "--update", dest="operation", action="store_const", const="update",
+    help="update Ventoy without resizing existing partitions (Ventoy -u)",
+  )
+  parser.set_defaults(operation="install")
   parser.add_argument(
     "--iso-percent",
-    required=True,
     type=percentage,
-    help="percentage for Part1, e.g. 15 or 12.5%%",
+    help="percentage for Part1, e.g. 15 or 12.5%% (required for install/reinstall)",
   )
   parser.add_argument(
     "-g", "--gpt", action="store_true", help="use GPT (otherwise Ventoy uses MBR)"
@@ -145,9 +200,34 @@ def main(argv=None):
   parser.add_argument(
     "--execute",
     action="store_true",
-    help="install now; keep Ventoy's confirmation prompts",
+    help="run the selected operation (otherwise preview only)",
+  )
+  parser.add_argument(
+    "--apply", action="store_true", help="automatically approve the first prompt",
+  )
+  parser.add_argument(
+    "--verify", action="store_true",
+    help="imply --apply and --verbose; require exact YES before execution",
+  )
+  parser.add_argument(
+    "-v", "--verbose", action="store_true",
+    help="print full disk metadata and operation details",
+  )
+  parser.add_argument(
+    "--yes", "--noconfirm", "--noconfir", dest="assume_yes", action="store_true",
+    help="autoapprove the final prompt after a warning and 3 seconds; "
+    "combine with --apply for both prompts (--verify still requires YES)",
+  )
+  parser.add_argument(
+    "--force", action="store_true",
+    help="equivalent to --apply --yes; does not select reinstall or bypass --verify",
   )
   args = parser.parse_args(argv)
+  if args.operation != "update" and args.iso_percent is None:
+    parser.error("--iso-percent is required for install/reinstall")
+  args.apply = args.apply or args.verify or args.force
+  args.assume_yes = args.assume_yes or args.force
+  args.verbose = args.verbose or args.verify
 
   try:
     # Some Ventoy launchers expand $* unquoted; keep labels safe through them.
@@ -159,36 +239,75 @@ def main(argv=None):
     device = Path(args.device).resolve()
     disk = read_disk(device)
     total = disk["size"]
-    if not args.gpt and total > 2**41:
-      raise ValueError("use -g for GPT on disks larger than 2 TiB")
-    reserved, iso_bytes = partition_sizes(total, args.iso_percent, args.gpt)
     executable = shutil.which(args.ventoy)
     if executable is None:
       raise ValueError(f"Ventoy executable not found: {args.ventoy}")
-    command = [executable, "-i", "-r", str(reserved)]
-    if args.gpt:
-      command.append("-g")
-    command.extend(["-L", args.label, str(device)])
+    command = [executable]
+    if args.operation == "update":
+      command.extend(["-u", str(device)])
+    else:
+      if not args.gpt and total > 2**41:
+        raise ValueError("use -g for GPT on disks larger than 2 TiB")
+      reserved, iso_bytes = partition_sizes(total, args.iso_percent, args.gpt)
+      command.extend([
+        "-I" if args.operation == "reinstall" else "-i", "-r", str(reserved),
+      ])
+      if args.gpt:
+        command.append("-g")
+      command.extend(["-L", args.label, str(device)])
 
+    print(f"Operation: {args.operation}")
     print(f"Disk: {device} ({total / GIB:.2f} GiB)")
-    print(
-      f"ISO partition: ~{iso_bytes / GIB:.2f} GiB "
-      f"({100 * iso_bytes / total:.4f}% of disk)"
-    )
-    print(f"Ventoy boot partition: {BOOT_BYTES // MIB} MiB")
-    print(
-      f"Reserved for later partitions: ~{reserved * MIB / GIB:.2f} GiB "
-      f"(-r {reserved})"
-    )
+    if args.operation == "update":
+      print(
+        "Update preserves the existing partition layout and ISO files. "
+        "--iso-percent, -g/--gpt and -L/--label do not apply and are ignored."
+      )
+    else:
+      print(
+        f"ISO partition: ~{iso_bytes / GIB:.2f} GiB "
+        f"({100 * iso_bytes / total:.4f}% of disk)"
+      )
+      print(f"Ventoy boot partition: {BOOT_BYTES // MIB} MiB")
+      print(
+        f"Reserved for later partitions: ~{reserved * MIB / GIB:.2f} GiB "
+        f"(-r {reserved})"
+      )
+    if args.verbose:
+      print(f"Capacity: {total} bytes; logical sector: {disk['log-sec']} bytes")
+      if args.operation != "update":
+        print(f"Requested ISO percentage: {float(args.iso_percent):g}%")
+        print(f"Partition table: {'GPT' if args.gpt else 'MBR'}; label: {args.label}")
+        print(f"Estimated ISO bytes: {iso_bytes}; reserved MiB: {reserved}")
+      print(f"Execution: {'enabled' if args.execute else 'preview only'}")
+      print(
+        f"Approvals: first={'automatic' if args.apply else 'interactive'}, "
+        f"final={'exact YES' if args.verify else 'automatic' if args.assume_yes else 'interactive'}"
+      )
+      print("Disk metadata (lsblk):")
+      print(json.dumps(disk, indent=2, sort_keys=True))
     print(f"Command: {shlex.join(command)}", flush=True)
 
     if not args.execute:
-      print("Preview only. Add --execute and run with sudo to install.")
+      print("Preview only. Add --execute and run with sudo to run the operation.")
       return 0
 
     check_execution(device, disk)
-    print(f"Installation will ERASE existing data on {device}.", flush=True)
-    return subprocess.run(command, check=False).returncode
+    if args.operation != "update":
+      print(f"Installation will ERASE existing data on {device}.", flush=True)
+    if not (args.apply or args.assume_yes):
+      return subprocess.run(command, check=False).returncode
+    if not confirm_operation(args, device):
+      print("Cancelled. Ventoy was not started.")
+      return 1
+    # Supported Ventoy installs have two y/Y prompts; updates have one.
+    # Keep the input finite: additional prompts receive EOF, never blanket consent.
+    answers = "y\n" if args.operation == "update" else "y\ny\n"
+    return subprocess.run(command, input=answers, text=True, check=False).returncode
+  except EOFError:
+    parser.exit(1, f"{parser.prog}: error: confirmation input closed; Ventoy not started\n")
+  except KeyboardInterrupt:
+    parser.exit(130, f"\n{parser.prog}: interrupted\n")
   except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
     parser.exit(1, f"{parser.prog}: error: {error}\n")
 
